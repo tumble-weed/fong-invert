@@ -74,7 +74,7 @@ def get_pytorch_module(net, blob):
 def invert(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2, 
         alpha_lambda=1e-5,  tv_lambda=1e-5, epochs=200, learning_rate=1e2, 
         momentum=0.9, decay_iter=100, decay_factor=1e-1, print_iter=25, 
-        cuda=False):
+        device='cpu'):
     mu = [0.485, 0.456, 0.406]
     sigma = [0.229, 0.224, 0.225]
 
@@ -94,69 +94,76 @@ def invert(image, network='alexnet', size=227, layer='features.4', alpha=6, beta
 
     img_ = transform(Image.open(image)).unsqueeze(0)
     print img_.size()
-    
+    ref = img_.to(device)
     def get_model(network,device):
         model = models.__dict__[network](pretrained=True)
         model.eval()
         model.to(device)
         return model
     get_model(network,device)
-    def invert_():
+
+#     def get_acts(model, input): 
+#         del activations[:]
+#         _ = model(input)
+#         assert(len(activations) == 1)
+#         return activations[0]
+
+    
         
+    def setup_network(model,layer):
+        activations = []    
+        def hook_acts(module, input, output):
+            activations.append(output)
+        _ = get_pytorch_module(model, layer).register_forward_hook(hook_acts)
+        return activations
+    
+    setup_network(model,layer)
 
-    activations = []
-
-    def hook_acts(module, input, output):
-        activations.append(output)
-
-    def get_acts(model, input): 
-        del activations[:]
-        _ = model(input)
-        assert(len(activations) == 1)
-        return activations[0]
-
-    _ = get_pytorch_module(model, layer).register_forward_hook(hook_acts)
-    input_var = Variable(img_.cuda() if cuda else img_)
-    ref_acts = get_acts(model, input_var).detach()
-
-    x_ = Variable((1e-3 * torch.randn(*img_.size()).cuda() if cuda else 
+    
+    def invert_(ref,model,alpha,beta,learning_rate,momentum,epochs):
+        ref_acts = get_acts(model, ref).detach()
+        x_ = Variable((1e-3 * torch.randn(*img_.size()).cuda() if cuda else 
         1e-3 * torch.randn(*img_.size())), requires_grad=True)
 
+#         alpha_f = lambda x: alpha_prior(x, alpha=alpha)
+#         tv_f = lambda x: tv_norm(x, beta=beta)
+#         loss_f = lambda x: norm_loss(x, ref_acts)
 
-    alpha_f = lambda x: alpha_prior(x, alpha=alpha)
-    tv_f = lambda x: tv_norm(x, beta=beta)
-    loss_f = lambda x: norm_loss(x, ref_acts)
+        optimizer = torch.optim.SGD([x_], lr=learning_rate, momentum=momentum)
 
-    optimizer = torch.optim.SGD([x_], lr=learning_rate, momentum=momentum)
+        for i in range(epochs):
+#             acts = get_acts(model, x_)
+            del activations[:]
+            _ = model(x_)
+            acts = activations[0]
 
-    for i in range(epochs):
-        acts = get_acts(model, x_)
 
-        alpha_term = alpha_f(x_)
-        tv_term = tv_f(x_)
-        loss_term = loss_f(acts)
+            alpha_term = alpha_prior(x_, alpha=alpha)
 
-        tot_loss = alpha_lambda*alpha_term + tv_lambda*tv_term + loss_term
+            tv_term = tv_norm(x_, beta=beta)
+            loss_term = norm_loss(acts, ref_acts)
 
-        if (i+1) % print_iter == 0:
-            print('Epoch %d:\tAlpha: %f\tTV: %f\tLoss: %f\tTot Loss: %f' % (i+1,
-                alpha_term.data.cpu().numpy()[0], tv_term.data.cpu().numpy()[0],
-                loss_term.data.cpu().numpy()[0], tot_loss.data.cpu().numpy()[0]))
+            tot_loss = alpha_lambda*alpha_term + tv_lambda*tv_term + loss_term
 
-        optimizer.zero_grad()
-        tot_loss.backward()
-        optimizer.step()
+            if (i+1) % print_iter == 0:
+                print('Epoch %d:\tAlpha: %f\tTV: %f\tLoss: %f\tTot Loss: %f' % (i+1,
+                    alpha_term.data.cpu().numpy()[0], tv_term.data.cpu().numpy()[0],
+                    loss_term.data.cpu().numpy()[0], tot_loss.data.cpu().numpy()[0]))
 
-        if (i+1) % decay_iter == 0:
-            decay_lr(optimizer, decay_factor)
+            optimizer.zero_grad()
+            tot_loss.backward()
+            optimizer.step()
 
-    f, ax = plt.subplots(1,2)
-    ax[0].imshow(detransform(img_[0]))
-    ax[1].imshow(detransform(x_[0].data.cpu()))
-    for a in ax:
-        a.set_xticks([])
-        a.set_yticks([])
-    plt.show()
+            if (i+1) % decay_iter == 0:
+                decay_lr(optimizer, decay_factor)
+
+        f, ax = plt.subplots(1,2)
+        ax[0].imshow(detransform(img_[0]))
+        ax[1].imshow(detransform(x_[0].data.cpu()))
+        for a in ax:
+            a.set_xticks([])
+            a.set_yticks([])
+        plt.show()
 
 
 if __name__ == '__main__':
