@@ -75,9 +75,9 @@ def invert(image, network='alexnet', size=227, layer='features.4', alpha=6, beta
         alpha_lambda=1e-5,  tv_lambda=1e-5, epochs=200, learning_rate=1e2, 
         momentum=0.9, decay_iter=100, decay_factor=1e-1, print_iter=25, 
         cuda=False):
-
     mu = [0.485, 0.456, 0.406]
     sigma = [0.229, 0.224, 0.225]
+
 
     transform = transforms.Compose([
         transforms.Scale(size=size),
@@ -92,13 +92,17 @@ def invert(image, network='alexnet', size=227, layer='features.4', alpha=6, beta
         transforms.ToPILImage(),
     ])
 
-    model = models.__dict__[network](pretrained=True)
-    model.eval()
-    if cuda:
-        model.cuda()
-
     img_ = transform(Image.open(image)).unsqueeze(0)
     print img_.size()
+    
+    def get_model(network,device):
+        model = models.__dict__[network](pretrained=True)
+        model.eval()
+        model.to(device)
+        return model
+    get_model(network,device)
+    def invert_():
+        
 
     activations = []
 
