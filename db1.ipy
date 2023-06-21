@@ -1,0 +1,271 @@
+%load_ext autoreload
+%autoreload 2
+import os
+import colorful
+import torch
+
+"""
+if False and os.environ.get("DBG_SH",False) == "1":
+    get z buffering information from:
+    https://github.com/facebookresearch/pytorch3d/blob/c759fc560f84eaff3577afac0083a2a2f07b349f/pytorch3d/renderer/points/rasterizer.py#L128
+    # Calculate vectors from common origin to every point in point cloud
+    # o = self.viewo[id].reshape(-1,3)
+    
+    vectors = self.vertsparam - self.viewo[id][0,0][None,:]
+    # Calculate dot product of vectors with ray direction
+    distances = np.sum(vectors * self.viewdir[id][:, np.newaxis, :], axis=-1)
+
+    # Find minimum distance along each ray
+    min_distances = np.min(distances, axis=-1)
+
+    # return min_distances
+    
+    # distance_to_nearest_point
+    # pass
+    points_proj = rasterizer.transform(point_cloud)
+    raster_settings = rasterizer.raster_settings
+    from pytorch3d.renderer.points.rasterizer import rasterize_points
+    idx, zbuf, dists2 = rasterize_points(
+        points_proj,
+        image_size=raster_settings.image_size,
+        radius=raster_settings.radius,
+        points_per_pixel=raster_settings.points_per_pixel,
+        bin_size=raster_settings.bin_size,
+        max_points_per_bin=raster_settings.max_points_per_bin,
+    )    
+if False:
+    fragments = renderer.rasterizer(point_cloud)
+    r = renderer.rasterizer.raster_settings.radius
+    dists2 = fragments.dists.permute(0, 3, 1, 2)
+    weights = 1 - dists2 / (r * r)
+    depths = fragments[1]
+"""
+if False:
+    bad = (sol.fun > 1e-1)
+    reinit_t_diff = sol.x
+    # midpoints = (reinit_x[1:] + reinit_x[:-1])/2.
+    # reinit_x[bad] = midpoints[1:][bad]
+    found_t = reinit_x.cumsum()
+    midpoints = np.zeros(reinit_t_diff.shape)
+    midpoints[1:] = (found_t[1:] + found_t[:-1])/2.
+    found_t[bad] =  midpoints[bad]
+    
+    reinit_t = np.zeros(sol.x.shape)
+    reinit_t[1:] = sol.x[1:] * (sol.x[1:] < 0).astype(np.float32)
+    sol2 = optimize.root(area_discrepancy, 
+                                # np.linspace(mask_.min().item(),mask_.max().item(),len(required_areas)), 
+                                reinit_t,
+                                jac=True, method='lm') #'hybr' didnt work well
+if False:
+    import numpy as np
+    import cv2    
+    # from config.default import config as cfg
+    from timm.models import create_model as create_deit_model
+    # args = update_config()
+    NUM_CLASSES = 1000
+    # ARCH = "deit_tscam_small_patch16_224"
+    ARCH = "deit_scm_small_patch16_224"
+    model = create_deit_model(
+        ARCH,
+        pretrained=True,
+        num_classes=NUM_CLASSES,
+        drop_rate=0.0,
+        drop_path_rate=0.1,
+        drop_block_rate=None,
+    )
+    checkpoint_path = "../Imagenet_SCM/ckpt/model_best.pth"
+    checkpoint = torch.load(checkpoint_path)
+    pretrained_dict = {}
+
+    for k, v in checkpoint['state_dict'].items():
+        k_ = '.'.join(k.split('.')[1:])
+
+        pretrained_dict.update({k_: v})    
+    model.load_state_dict(pretrained_dict)
+    model.eval()
+    impath = "/root/evaluate-saliency-4/fong-invert/grace_hopper.jpg"
+    from PIL import Image
+    import torchvision.transforms as transforms
+    mu = [0.485, 0.456, 0.406]
+    sigma = [0.229, 0.224, 0.225]    
+    size = (224,224)
+    transform = transforms.Compose([
+        transforms.Resize(size=size),
+        transforms.CenterCrop(size=size),
+        transforms.ToTensor(),
+        transforms.Normalize(mu, sigma),
+    ])    
+    ref = transform(Image.open(impath)).unsqueeze(0)
+    import skimage.io
+    im = skimage.io.imread(impath)
+    #=========================================================================
+    cls_scores, cams, _, _ = model(ref)
+    cls_scores = cls_scores.cpu().tolist()
+    cams = cams.cpu().tolist()    
+    max_k = 1
+
+    cls_scores = np.array(cls_scores)
+    topk_ind = torch.topk(torch.from_numpy(
+    cls_scores), max_k)[-1].numpy()  # [B K]    
+    cams = np.array([np.take(a, idx, axis=0) for (a, idx) in zip(
+                cams, topk_ind)])  # index for each batch # [B topk H W]    
+    def resizeNorm(cam, size=(224, 224)):
+        cam = cv2.resize(cam, (size[0], size[1]))
+        cam_min, cam_max = cam.min(), cam.max()
+        cam = (cam - cam_min) / (cam_max - cam_min)
+        return cam    
+
+
+    def compute_bboxes_from_scoremaps(scoremap, scoremap_threshold_list,
+                                    multi_contour_eval=False):
+        """
+        Args:
+            scoremap: numpy.ndarray(dtype=np.float32, size=(H, W)) between 0 and 1
+            scoremap_threshold_list: iterable
+            multi_contour_eval: flag for multi-contour evaluation
+        Returns:
+            estimated_boxes_at_each_thr: list of estimated boxes (list of np.array)
+                at each cam threshold
+            number_of_box_list: list of the number of boxes at each cam threshold
+        """
+        check_scoremap_validity(scoremap)
+        height, width = scoremap.shape
+        scoremap_image = np.expand_dims((scoremap * 255).astype(np.uint8), 2)
+
+        def scoremap2bbox(threshold):
+            _, thr_gray_heatmap = cv2.threshold(
+                src=scoremap_image,
+                thresh=int(threshold * np.max(scoremap_image)),
+                maxval=255,
+                type=cv2.THRESH_BINARY)
+            contours = cv2.findContours(
+                image=thr_gray_heatmap,
+                mode=cv2.RETR_TREE,
+                method=cv2.CHAIN_APPROX_SIMPLE)[_CONTOUR_INDEX]
+
+            if len(contours) == 0:
+                return np.asarray([[0, 0, 0, 0]]), 1
+
+            if not multi_contour_eval:
+                contours = [max(contours, key=cv2.contourArea)]
+
+            estimated_boxes = []
+            for contour in contours:
+                x, y, w, h = cv2.boundingRect(contour)
+                x0, y0, x1, y1 = x, y, x + w, y + h
+                x1 = min(x1, width - 1)
+                y1 = min(y1, height - 1)
+                estimated_boxes.append([x0, y0, x1, y1])
+
+            return np.asarray(estimated_boxes), len(contours)
+
+        estimated_boxes_at_each_thr = []
+        number_of_box_list = []
+        for threshold in scoremap_threshold_list:
+            boxes, number_of_box = scoremap2bbox(threshold)
+            estimated_boxes_at_each_thr.append(boxes)
+            number_of_box_list.append(number_of_box)
+
+        return estimated_boxes_at_each_thr, number_of_box_list
+
+
+    def check_scoremap_validity(scoremap):
+        if not isinstance(scoremap, np.ndarray):
+            raise TypeError("Scoremap must be a numpy array; it is {}."
+                            .format(type(scoremap)))
+        if len(scoremap.shape) != 2:
+            raise ValueError("Scoremap must be a 2D array; it is {}D."
+                            .format(len(scoremap.shape)))
+        if np.isnan(scoremap).any():
+            raise ValueError("Scoremap must not contain nans.")
+        if (scoremap > 1).any() or (scoremap < 0).any():
+            raise ValueError("Scoremap must be in range [0, 1]."
+                            "scoremap.min()={}, scoremap.max()={}."
+                            .format(scoremap.min(), scoremap.max()))    
+    def draw_bbox(image, iou, gt_box, pred_box, draw_box=True, draw_txt=True):
+
+        def draw_bbox(img, box1, box2, color1=(0, 0, 255), color2=(0, 255, 0)):
+            for i in range(len(box1)):
+                cv2.rectangle(img, (box1[i,0], box1[i,1]), (box1[i,2], box1[i,3]), color1, 1)
+            for i in range(len(box2)):
+                cv2.rectangle(img, (box2[i,0], box2[i,1]), (box2[i,2], box2[i,3]), color2, 1)
+            return img
+
+        def mark_target(img, text='target', pos=(25, 25), size=2):
+            cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), size)
+            return img
+
+        boxed_image = image.copy()
+        if draw_box:
+            # draw bbox on image
+            boxed_image = draw_bbox(boxed_image, gt_box, pred_box)
+        if draw_txt:
+            # mark the iou
+            mark_target(boxed_image, '%.1f' % (iou * 100), (140, 30), 2)
+
+        return boxed_image
+    scoremap = cams[0,0]
+    RESHAPE_SIZE=224
+    _CONTOUR_INDEX = 1 if cv2.__version__.split('.')[0] == '3' else 0
+    multi_contour_eval=False
+    scoremap = resizeNorm(scoremap, (RESHAPE_SIZE, RESHAPE_SIZE))
+    opt_thred = 0.5
+    boxes_at_thresholds, number_of_box_list = compute_bboxes_from_scoremaps(
+                    scoremap=scoremap,
+                    scoremap_threshold_list=[opt_thred],
+                    multi_contour_eval=multi_contour_eval)    
+    tensor_to_numpy = lambda t:t.detach().cpu().numpy()
+    ref_im = tensor_to_numpy(ref.permute(0,2,3,1))
+    boxed_image = draw_bbox(ref_im[0], opt_thred, boxes_at_thresholds[0], boxes_at_thresholds[0], draw_box=True, draw_txt=True)
+if False and 'using orthographic':
+    R, T = look_at_view_transform(eye = [(0,0,10)],at=((0,0,0,),))
+    cameras = FoVOrthographicCameras(device=device, R=R, T=T)    
+    rasterizer = PointsRasterizer(cameras=cameras, raster_settings=raster_settings)
+    renderer = PointsRenderer(
+                rasterizer=rasterizer,
+                compositor=AlphaCompositor()
+            )
+    point_cloud = Pointclouds(points=[vertsparam], features=[sh_param])
+    images = renderer(point_cloud)
+    my_utils.img_save2(tensor_to_numpy(images)[0],'pc-rendered.png') 
+    
+if False and 'using perspective':
+    focal_length = 2
+    K = np.array([[focal_length,   0.       , focal_length//2 ],
+            [  0.       , focal_length, focal_length//2    ],
+            [  0.       ,   0.       ,   1.       ]])                  
+    R, T = look_at_view_transform(eye = [(0,0,3)],at=((0,0,0,),))
+    # cameras = FoVOrthographicCameras(device=device, R=R, T=T)    
+    cameras = PerspectiveCameras(
+                                    focal_length=K[0][0] / K[0][2],
+                                        device=device, 
+                                        R=R, T=T)
+    rasterizer = PointsRasterizer(cameras=cameras, raster_settings=raster_settings)
+    renderer = PointsRenderer(
+                rasterizer=rasterizer,
+                compositor=AlphaCompositor()
+            )
+    point_cloud = Pointclouds(points=[vertsparam], features=[sh_param])
+    images = renderer(point_cloud)
+    my_utils.img_save2(tensor_to_numpy(images)[0],'pc-rendered.png') 
+    
+if True and 'using perspective':
+    focal_length = 0.5
+    # K = np.array([[focal_length,   0.       , focal_length//2 ],
+    #         [  0.       , focal_length, focal_length//2    ],
+    #         [  0.       ,   0.       ,   1.       ]])                  
+    R, T = look_at_view_transform(eye = [(0,0,2)],at=((0,0,0,),))
+    # cameras = FoVOrthographicCameras(device=device, R=R, T=T)    
+    cameras = PerspectiveCameras(
+                                    # focal_length=K[0][0] / K[0][2],
+                                    focal_length = focal_length,
+                                        device=device, 
+                                        R=R, T=T)
+    rasterizer = PointsRasterizer(cameras=cameras, raster_settings=raster_settings)
+    renderer = PointsRenderer(
+                rasterizer=rasterizer,
+                compositor=AlphaCompositor()
+            )
+    point_cloud = Pointclouds(points=[vertsparam], features=[sh_param])
+    images = renderer(point_cloud)
+    my_utils.img_save2(tensor_to_numpy(images)[0],'pc-rendered.png')     
