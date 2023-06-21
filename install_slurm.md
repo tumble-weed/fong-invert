@@ -1,0 +1,1 @@
+https://stackoverflow.com/questions/53028499/setting-up-slurm-conf-file-for-single-computer

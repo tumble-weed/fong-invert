@@ -1,0 +1,15 @@
+{
+    // "terminal.integrated.gpuAcceleration": "canvas",
+    "terminal.integrated.gpuAcceleration": "off",
+    // "terminal.integrated.defaultLocation": "editor",
+    "terminal.integrated.showLinkHover" : "false",
+    "debug.console.wordWrap": true,
+    "workbench.editor.wrapTabs": true,
+    "workbench.colorTheme": "Default Light+",
+    "workbench.action.createTerminalEditorSide": "right",
+    "git.ignoreLimitWarning": true,
+    "editor.wordWrap": "bounded",
+    "workbench.editor.tabSizing": "fit",
+    "workbench.editor.pinnedTabSizing": "shrink",
+    "workbench.editor.highlightModifiedTabs": true,
+}

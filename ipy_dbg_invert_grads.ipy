@@ -1,0 +1,28 @@
+%load_ext autoreload
+%autoreload 2
+from torch import nn
+"""
+replace all relu in model with non in place
+"""
+def replace_relu_with_non_inplace(model):
+    for n, m in model.named_modules():
+        if isinstance(m, nn.ReLU):
+            model._modules[n] = nn.ReLU(inplace=False)
+
+# """
+# softplus as differntiable alternate to relu
+# """
+# class Softplus(nn.Module):
+#     def __init__(self):
+#         super(Softplus, self).__init__()
+#         self.softplus = nn.Softplus(beta=1,threshold=20)
+#     def forward(self, x):
+#         return self.softplus(x)
+
+"""
+replace all relu with softplus in model
+"""
+def replace_relu_with_softplus(model):
+    for n, m in model.named_modules():
+        if isinstance(m, nn.ReLU):
+            model._modules[n] = nn.Softplus(beta=1,threshold=20)
