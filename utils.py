@@ -224,7 +224,7 @@ def print_tensors():
             pass
 def printl(*messages,log_file='log.txt'):
     d =SAVE_DIR
-    print(messages)
+    print(*messages)
     with open(os.path.join(d,log_file),'a') as f:
         message_str = ' '.join([str(m) for m in messages])
         f.write(message_str+'\n')

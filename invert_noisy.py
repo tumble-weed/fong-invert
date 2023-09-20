@@ -13,7 +13,7 @@ import numpy as np
 import os
 import utils
 import matplotlib.pyplot as plt
-
+import tqdm
 from PIL import Image
 #==================================================================
 from dip.common_utils import get_noise#,get_params
@@ -37,6 +37,8 @@ from torch_memory_snippet import *
 
 from hooks import setup_network
 from sparsity import setup_network_for_comprehensive_sparsity
+# import torch.cuda.amp as amp
+from apex import amp
 #==================================================================
 tensor_to_numpy = lambda x: x.detach().cpu().numpy()
 global MAJOR_PREFIX, MINOR_PREFIX
@@ -113,8 +115,10 @@ def get_save_dir():
 def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2, 
         alpha_lambda=1e-5,  tv_lambda=1e-5, epochs=200, learning_rate=1e2, 
         momentum=0.9, decay_iter=100, decay_factor=1e-1, print_iter=25, 
-        device='cpu',method=None,cam_weight=None):
+        device='cpu',method=None,cam_weight=None,use_fp16=False):
     #SET OPTS
+    if os.environ.get('DBG_FP16',False) == '1':
+        use_fp16 = True
     utils.cipdb('DBG_CLASS')
     opts.runner = "self"
     opts.cam_loss = True
@@ -128,16 +132,19 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
     opts.learning_rate = learning_rate;del learning_rate
     opts.layer = layer;del layer
     opts.print_iter = print_iter;del print_iter
-    opts.n_noise = 10
+    opts.n_noise = 1
     opts.sync = False
     opts.noise_jitter = False
     opts.min_noise_mag = None
     opts.observer_model = None
+    opts.use_fp16 = use_fp16; del use_fp16
+    data_type = torch.half if opts.use_fp16 else torch.float
     utils.SYNC = opts.sync
     global MAJOR_PREFIX,MINOR_PREFIX
     # utils.SAVE_DIR = os.path.join(utils.DEBUG_DIR,'_'.join([MAJOR_PREFIX,MINOR_PREFIX]))
     # utils.SAVE_DIR = os.path.join(utils.DEBUG_DIR,MAJOR_PREFIX,MINOR_PREFIX)
     # import ipdb;ipdb.set_trace()
+    # utils.cipdb('DBG_MATCH')
     utils.set_save_dir(get_save_dir(),purge=opts.purge)
 
     # import ipdb; ipdb.set_trace()
@@ -167,6 +174,8 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
     def get_model(network,device):
         model = models.__dict__[network](pretrained=True)
         model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
         model.to(device)
         return model
     model = get_model(opts.network,device)
@@ -188,7 +197,8 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
         setup_network(model,get_pytorch_module(model, gradcam_layer),activations_gradcam,grads=grads_gradcam,backward=True)
         if True:
             activations = []
-            setup_network(model,get_pytorch_module(model, opts.layer),activations)
+            if opts.LOSS_MODE == 'match':
+                setup_network(model,get_pytorch_module(model, opts.layer),activations)
             # setup for gradcam
             # default gradcam layer for alexnet
         
@@ -196,8 +206,11 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
             # import ipdb; ipdb.set_trace()
             # hooks.assets['backward',gradcam_layer].append(grads_gradcam)
             # hooks.assets['forward',gradcam_layer].append(activations_gradcam)
-            activations_last_mpool = []
-            register_forward_hook(model,get_pytorch_module(model, 'features.12'),activations_last_mpool)
+            TRACK_LAST_MPOOL_SPARSITY = False
+            GET_CAM = False
+            if GET_CAM or TRACK_LAST_MPOOL_SPARSITY:
+                activations_last_mpool = []
+                register_forward_hook(model,get_pytorch_module(model, 'features.12'),activations_last_mpool)
             activations_sparsity,noisy_activations_sparsity,avg_angles,avg_mags = [],[],[],[]
             utils.cipdb('DBG_ABLATION')
             # import ipdb; ipdb.set_trace()
@@ -208,31 +221,11 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
                                                     layer_ixs = opts.conv_layer_ixs,
                                                     noise_mags=opts.noise_mags,
                                                     angular_simplicity=False)
-        pass
-    # log avg_angle per layer in trends
+            print('see which layers are noisy')
+            utils.cipdb('DBG_MATCH')
 
-    # if os.environ.get('DBG_LEAK',False):
-    #     #===============================================
-    #     import ipdb; ipdb.set_trace()
-    #     del trends
-    #     hooks.clear_hooks()
-    #     import sparsity
-    #     sparsity.clear_hooks()
-    #     del model
-    #     import gc;gc.collect()
-    #     import ipdb; ipdb.set_trace()
-    #     #===============================================    
-    #     return
-    
-    # def invert_(ref,model,alpha,beta,learning_rate,momentum,epochs):
-    
-    # ref_acts = get_acts(model, ref).detach()
-    # def get_acts(model, input): 
-    #     del activations[:]
-    #     _ = model(input)
-    #     assert(len(activations) == 1)
-    #     return activations[0]
-    # import ipdb; ipdb.set_trace()
+        pass
+
     utils.cipdb('DBG_LEAK')
     if os.environ.get('REF_EDGE_ALIGN',False):
         ref_edge_mags,ref_edge_dirs = channelwise_edge_gradients(ref)
@@ -249,7 +242,7 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
         utils.cipdb('DBG_LEAK')
 
         # opts.target_class = ref_scores.argmax(dim=-1)
-        opts.target_class = [153]
+        opts.target_class = [10001]
         # opts.target_class = [5000000]
         
         # assert False
@@ -283,8 +276,20 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
             n_unique_x = len(opts.target_class) * len(opts.image)
             x__ = (torch.tensor( 
                 prng.uniform(size = (n_unique_x,)+ref.shape[1:])
-                )).float().to(device).requires_grad_(True)
+                ,dtype = data_type
+                )).to(device).requires_grad_(True)
+            # import ipdb;ipdb.set_trace()
         optimizer = torch.optim.SGD([x__], lr=opts.learning_rate, momentum=momentum)
+        if opts.use_fp16:
+            static_loss_scale = 256
+            static_loss_scale = "dynamic"
+            # _, optimizer = amp.initialize([], optimizer, opt_level="O2", loss_scale=static_loss_scale)
+            model, optimizer = amp.initialize(model, optimizer,
+                                    #   opt_level=args.opt_level,
+                                    #   keep_batchnorm_fp32=args.keep_batchnorm_fp32,
+                                    #   loss_scale=args.loss_scale
+                                      )
+
     elif method == 'dip':
         ############################################################
         imsize = 224
@@ -331,7 +336,8 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
 
     opts.NOISE_ANNEAL = False
     utils.cipdb('DBG_LEAK')
-    for i in range(opts.epochs):
+    for i in tqdm.tqdm(range(opts.epochs)):
+        print(colorful.green(get_save_dir()))
         utils.cipdb('DBG_CLASS')
 #             acts = get_acts(model, x_)
         if opts.NOISE_ANNEAL:
@@ -431,10 +437,13 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
                 noisy_layer.noise_mag = orig_mag
                 
             #=====================================================
-            trends['kl_div_observer'].append(kl_div_observer.item())
+            # import ipdb;ipdb.set_trace()
+            trends['kl_div_observer'].append(kl_div_observer.mean().item())
             trends['spearman_corr'].append(spearman_corr)
         #===================================================================
         x_scores = model(x_for_forward)
+        # print('see shape of x_scores')
+        # utils.cipdb('DBG_MATCH')
         trends['x_scores'].append(tensor_to_numpy(x_scores))
         # utils.cipdb("DBG_OBSERVER")
 
@@ -450,7 +459,8 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
             if (len(opts.target_class) == 1) and (len(opts.image) == 1):
                 print(colorful.brown(f"class: {x_scores.mean(dim=0).argmax()} target class {opts.target_class}" ))
         x_probs = torch.softmax(x_scores, dim=-1)
-        acts = activations[0]
+        if activations:
+            acts = activations[0]
         gradcam_acts = activations_gradcam[0]
         alpha_term = alpha_prior(x_, alpha=alpha)
         #---------------------------------------------------------------
@@ -473,12 +483,16 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
             if (i+1)%print_iter == 0:
                 print(x_edge_alignment)
         #---------------------------------------------------------------
-        
+        if os.environ.get('DBG_MATCH',False):
+            import ipdb;ipdb.set_trace()
         if opts.LOSS_MODE == 'match':
             # loss_term = norm_loss(acts, ref_acts)
             # return torch.abs(x.view(-1)**alpha).sum()
+            assert (opts.image.shape[1:] == (3,224,224))
+            """
             if len(opts.image) > 1:
                 import ipdb; ipdb.set_trace()
+            """
             # if opts.runner == "self":
             if opts.get("adaptive_match",False):
                 # loss_term = torch.div(((acts.mean(dim=0,keepdim=True) - ref_acts)**2).sum(), ((ref_acts)**2).sum())
@@ -501,6 +515,7 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
                 import ipdb; ipdb.set_trace()
                 for ii in range(opts.image):
                     loss_term_ii = torch.div(((acts[range(ii,acts.shape[0],len(opts.image))].mean(dim=0,keepdim=True) - ref_acts[ii:ii+1])**2).sum(), ((ref_acts[ii:ii+1])**2).sum())
+                
             
         elif opts.LOSS_MODE == 'max':
             assert len(opts.target_class) == x__.shape[0]
@@ -508,11 +523,12 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
             # torch.tile(torch.tensor([1,2]),4) = tensor([1, 2, 1, 2, 1, 2, 1, 2])
             loss_term = -x_scores[np.arange(len(target_classes)),target_classes].view(len(opts.target_class),opts.n_noise,-1).mean(dim=1).sum()
         #===============================================================
-        activations_last_mpool_ = (activations_last_mpool[0])
-        if opts.network == 'alexnet':
-            if not activations_last_mpool_.min() >= 0 :
-                import ipdb; ipdb.set_trace()
-        last_mpool_sparsity = activations_last_mpool_.abs().sum()
+        if TRACK_LAST_MPOOL_SPARSITY:
+            activations_last_mpool_ = (activations_last_mpool[0])
+            if opts.network == 'alexnet':
+                if not activations_last_mpool_.min() >= 0 :
+                    import ipdb; ipdb.set_trace()
+            last_mpool_sparsity = activations_last_mpool_.abs().sum()
         #===============================================================
         if False:
             sparsities = []
@@ -550,7 +566,9 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
             opts.tv_lambda = 1e-1
             # if dutils.get('score_sparsity_ablation',False):
             #     score_sparsity_lambda = dutils.get('score_sparsity_lambda',None)
-            score_sparsity_lambda = dutils.getif('score_sparsity_lambda',None,score_sparsity_lambda,'score_sparsity_ablation')
+            # import ipdb;ipdb.set_trace()
+            # score_sparsity_lambda = dutils.getif('score_sparsity_lambda',None,score_sparsity_lambda,'score_sparsity_ablation')
+            
             # if opts.target_class == 153:
             #     loss_lambda = 1.5
             print(colorful.orange(f"using score_sparsity_lambda = {score_sparsity_lambda}"))
@@ -574,12 +592,13 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
             kl_from_start = dist.kl_divergence(cat, cat0)
             kl_from_prev = dist.kl_divergence(cat, cat_prev) 
         #===============================================================
-        if i >0 :
-            activations_last_mpool_prev_ =   activations_last_mpool_
-        activations_last_mpool_ = (activations_last_mpool[0])
-        if i >0 :
-            change_in_mpool_from_prev = (activations_last_mpool_ - activations_last_mpool_prev_).norm(2)
-            trends['change_in_mpool_from_prev'].append(change_in_mpool_from_prev.item())  
+        if TRACK_LAST_MPOOL_SPARSITY:
+            if i >0 :
+                activations_last_mpool_prev_ =   activations_last_mpool_
+            activations_last_mpool_ = (activations_last_mpool[0])
+            if i >0 :
+                change_in_mpool_from_prev = (activations_last_mpool_ - activations_last_mpool_prev_).norm(2)
+                trends['change_in_mpool_from_prev'].append(change_in_mpool_from_prev.item())  
 
         #===============================================================
         trends['entropy'].append(entropy.sum().item())  
@@ -590,7 +609,15 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
         trends['loss_term'].append(loss_term.item())
         
         optimizer.zero_grad()
-        tot_loss.backward(retain_graph=True)
+        # tot_loss.backward(retain_graph=True)
+        if opts.use_fp16:
+            # optimizer.backward(loss)
+            with amp.scale_loss(tot_loss, optimizer) as scaled_loss:
+                scaled_loss.backward(retain_graph=True)
+        else:
+            tot_loss.backward(retain_graph=True)
+
+        
 
         if len(x__) == 1:
             grad_alignment_ = grad_alignment(x_pre_noise.grad,name='loss_term')
@@ -627,7 +654,7 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
             saliency = torch.zeros_like(x__)
             
         #-------------------------------------------------------------------------
-        if i>0 and 'fg_remove entropy':
+        if i>0 and 'fg_remove entropy' and False:
             from elp_masking import get_masked_input
             
             cam0_nrmz = cam0/(cam0.max() + (cam0.max() == 0).float())
@@ -660,7 +687,7 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
             trends['bg_entropy'].append(bg_entropy.sum().item())
             trends['x_entropy'].append(x_entropy.sum().item())
         #-------------------------------------------------------------------------
-        if 'cam loss':
+        if 'cam loss' and False:
             if True:
                 cam_norm = cam.sum()
                 cam0_norm = cam0.sum()
@@ -677,9 +704,9 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
                 # import ipdb; ipdb.set_trace()
                 cam_loss.backward()
         
-        trends['cam0_norm'].append(cam0_norm.item())
-        trends['cam0_sparsity'].append(cam0_sparsity.item())
-        trends['cam_norm'].append(cam_norm.item())
+            trends['cam0_norm'].append(cam0_norm.item())
+            trends['cam0_sparsity'].append(cam0_sparsity.item())
+            trends['cam_norm'].append(cam_norm.item())
         trends['cam_tv'].append(tv_cam.item())
 
             
@@ -714,12 +741,20 @@ def main(image, network='alexnet', size=227, layer='features.4', alpha=6, beta=2
                     for ii,target_class in enumerate(opts.target_class):
                         utils.img_save2(x__[ii:ii+1],f'x_{target_class}_iter_{i}.png')
                         utils.img_save2(x__[ii:ii+1],f'x_{target_class}.png',syncable=True) 
+                    import torchvision.utils as vutils
+                    grid= vutils.make_grid(x__,nrows = int(x__.shape[0]**0.5),normalize=False,scale_each=False)
+                    
+                    utils.img_save2(grid,f'x_iter_{i}.png')
+                    utils.img_save2(grid,f'x.png',syncable=True)                 
+                    # import ipdb;ipdb.set_trace()    
+                    """
                     for ii in range(ref.shape[0]):
                         # get imroot from opts.image[ii]
                         imroot = os.path.basename(opts.image[ii]).split('.')[0]
                         utils.img_save2(x__[ii:ii+1],f'x_{imroot}_iter_{i}.png')
                         utils.img_save2(x__,f'x_{imroot}.png',syncable=True)                        
-                        
+                    """
+
                 except Exception as e:
                     import ipdb;ipdb.set_trace()
                 # import ipdb;ipdb.set_trace()
@@ -854,7 +889,8 @@ def main2():
                 args.epochs = 2000
                 # if dutils.get('score_sparsity_ablation',False):
                 #     args.epochs = dutils.get('epochs',args.epochs)
-                args.epochs = dutils.getif('epochs',None,args.epochs,'score_sparsity_ablation')
+                # args.epochs = dutils.getif('epochs',None,args.epochs,'score_sparsity_ablation')
+                # import ipdb;ipdb.set_trace()
                 
                 # args.cam_weight = 5*1
                 # args.cam_weight = 4
